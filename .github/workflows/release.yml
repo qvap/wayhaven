@@ -1,0 +1,53 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Built on Arch: the binary targets the same libmpv/EGL/glibc that dots-hyprland users run
+    container: archlinux:base-devel
+    steps:
+      - name: Install build dependencies
+        run: pacman -Syu --noconfirm --needed git rust mpv mesa wayland
+
+      - uses: actions/checkout@v4
+
+      - name: Check tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          crate="v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          [ "$crate" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME != Cargo.toml $crate"; exit 1; }
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        run: |
+          name="wayhaven-${GITHUB_REF_NAME#refs/heads/}-x86_64-linux"
+          name="${name//\//-}"
+          mkdir -p "dist/$name"
+          cp target/release/wayhaven LICENSE README.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+          ./target/release/wayhaven --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wayhaven-x86_64-linux
+          path: dist/*.tar.gz*
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
