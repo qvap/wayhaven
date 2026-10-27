@@ -17,9 +17,12 @@ use crate::gfx::{self, Frame, Gfx};
 use crate::hypr::Hypr;
 use crate::ipc::{Client, Command, Server};
 use crate::mpv::{self, Mpv};
+use crate::still::Loader;
 
 /// Same as the shell's `Behavior on x { NumberAnimation { duration: 600; easing.type: Easing.OutCubic } }`
 const PARALLAX_DURATION: Duration = Duration::from_millis(600);
+/// Zoom/blur in when the screen locks (the shell used a 400 ms scale animation)
+const LOCK_DURATION: Duration = Duration::from_millis(400);
 const HYPR_DEBOUNCE: Duration = Duration::from_millis(40);
 const CONFIG_DEBOUNCE: Duration = Duration::from_millis(120);
 /// Never render the video texture larger than this (per side)
@@ -34,18 +37,22 @@ struct Parallax {
     from: (f64, f64),
     to: (f64, f64),
     start: Instant,
+    duration: Duration,
 }
 
 impl Parallax {
     fn new(v: (f64, f64)) -> Self {
-        Parallax { from: v, to: v, start: Instant::now() - PARALLAX_DURATION }
+        Self::with_duration(v, PARALLAX_DURATION)
+    }
+    fn with_duration(v: (f64, f64), duration: Duration) -> Self {
+        Parallax { from: v, to: v, start: Instant::now() - duration, duration }
     }
     fn value(&self, now: Instant) -> (f64, f64) {
-        let t = out_cubic(now.duration_since(self.start).as_secs_f64() / PARALLAX_DURATION.as_secs_f64());
+        let t = out_cubic(now.duration_since(self.start).as_secs_f64() / self.duration.as_secs_f64());
         (self.from.0 + (self.to.0 - self.from.0) * t, self.from.1 + (self.to.1 - self.from.1) * t)
     }
     fn animating(&self, now: Instant) -> bool {
-        now.duration_since(self.start) < PARALLAX_DURATION && self.from != self.to
+        now.duration_since(self.start) < self.duration && self.from != self.to
     }
     fn retarget(&mut self, to: (f64, f64), now: Instant) {
         if to != self.to {
@@ -91,13 +98,15 @@ pub struct App {
 
     gfx: Gfx,
     mpv: Option<Mpv>,
-    /// Latest video frame, sized for the largest output
+    /// Decodes still pictures off the main loop
+    still: Loader,
+    /// The still picture, or the latest video frame (sized for the largest output)
     frame: Option<Frame>,
-    /// Previous frame, kept while crossfading to a new video
+    /// Previous frame, kept while crossfading to a new wallpaper
     prev: Option<Frame>,
     fade_start: Option<Instant>,
     fade_duration: Duration,
-    /// A new file was loaded and we are waiting for its first decoded frame
+    /// A new file was loaded and we are waiting for its first decoded frame / picture
     awaiting_first_frame: bool,
     /// mpv has a frame that has not been rendered into `frame` yet
     frame_dirty: bool,
@@ -107,6 +116,13 @@ pub struct App {
     current_path: Option<String>,
     parallax: HashMap<String, Parallax>,
     zoom_override: Option<f64>,
+
+    /// Screen locked (from the shell): zoom + blur in, then lift the surfaces to the overlay layer
+    locked: bool,
+    /// Lock progress 0..1 in `.0`
+    lock_anim: Parallax,
+    /// Surfaces are currently on the overlay layer
+    on_overlay: bool,
 
     user_paused: bool,
     covered: HashMap<String, bool>,
@@ -130,8 +146,17 @@ impl App {
         if let Some(p) = &self.override_path {
             return Some(p.clone());
         }
+        let usable = |p: &String| !p.is_empty() && std::path::Path::new(p).is_file();
+        if self.locked && usable(&self.config.lock_wall) {
+            return Some(self.config.lock_wall.clone());
+        }
         let p = &self.config.wallpaper_path;
-        (config::is_video(p) && std::path::Path::new(p).is_file()).then(|| p.clone())
+        usable(p).then(|| p.clone())
+    }
+
+    /// Lock zoom/blur progress (0 when lock blur is disabled).
+    fn lock_t(&self, now: Instant) -> f64 {
+        if self.config.lock_blur { self.lock_anim.value(now).0 } else { 0.0 }
     }
 
     fn parallax_of(&self, name: Option<&str>, now: Instant) -> (f64, f64) {
@@ -210,9 +235,13 @@ impl App {
     }
 
     fn play(&mut self, path: String) {
-        log::info!("playing {path}");
         self.current_path = Some(path.clone());
         self.ensure_surfaces();
+        if !config::is_video(&path) {
+            self.show_still(path);
+            return;
+        }
+        log::info!("playing {path}");
         if self.mpv.is_none() {
             self.gfx.make_current(None);
             match Mpv::new(&self.mpv_options(), self.wl_display_ptr) {
@@ -224,7 +253,15 @@ impl App {
             }
             self.applied_pause = None;
         }
-        // Whatever is on screen becomes the crossfade source
+        self.begin_crossfade();
+        if let Err(e) = self.mpv.as_ref().unwrap().load(&path) {
+            log::error!("loadfile {path}: {e}");
+        }
+    }
+
+    /// Whatever is on screen becomes the crossfade source for the next wallpaper.
+    fn begin_crossfade(&mut self) {
+        self.gfx.make_current(None);
         if let Some(f) = self.frame.take() {
             if f.filled && self.prev.is_none() {
                 self.prev = Some(f);
@@ -236,8 +273,49 @@ impl App {
         self.fade_duration = Duration::from_millis(self.config.crossfade_ms);
         self.awaiting_first_frame = true;
         self.frame_dirty = false;
-        if let Err(e) = self.mpv.as_ref().unwrap().load(&path) {
-            log::error!("loadfile {path}: {e}");
+    }
+
+    fn show_still(&mut self, path: String) {
+        log::info!("showing {path}");
+        // A picture needs no decoder: don't keep mpv and its GL/CUDA state around
+        self.drop_player();
+        self.applied_pause = None;
+        self.begin_crossfade();
+        self.still.load(path);
+    }
+
+    fn on_still_decoded(&mut self) {
+        for d in self.still.take() {
+            // Superseded by another wallpaper while decoding
+            if self.current_path.as_deref() != Some(d.path.as_str()) {
+                continue;
+            }
+            let (w, h, rgba) = match d.result {
+                Ok(v) => v,
+                Err(e) => {
+                    log::error!("{}: {e}", d.path);
+                    continue;
+                }
+            };
+            self.gfx.make_current(None);
+            if let Some(old) = self.frame.take() {
+                self.gfx.delete_frame(old);
+            }
+            match self.gfx.create_frame(w as i32, h as i32, w as f64, h as f64) {
+                Ok(mut f) => {
+                    self.gfx.upload(&mut f, &rgba);
+                    log::debug!("picture {w}x{h} uploaded");
+                    self.frame = Some(f);
+                    self.awaiting_first_frame = false;
+                    if self.prev.is_some() {
+                        self.fade_start = Some(Instant::now());
+                    }
+                    self.mark_all_redraw();
+                }
+                Err(e) => log::error!("create frame: {e}"),
+            }
+            drop(rgba);
+            unsafe { libc::malloc_trim(0) };
         }
     }
 
@@ -250,7 +328,7 @@ impl App {
     }
 
     fn stop(&mut self) {
-        log::info!("video wallpaper inactive");
+        log::info!("no wallpaper");
         self.current_path = None;
         self.drop_player();
         for f in [self.frame.take(), self.prev.take()].into_iter().flatten() {
@@ -312,6 +390,12 @@ impl App {
         if self.config.zoom != old.zoom && self.zoom_override.is_none() {
             self.ensure_frame();
         }
+        if (self.config.lock_blur, self.config.lock_blur_radius, self.config.lock_zoom)
+            != (old.lock_blur, old.lock_blur_radius, old.lock_zoom)
+        {
+            self.mark_all_redraw();
+            self.sync_lock_layer(Instant::now());
+        }
         self.sync();
     }
 
@@ -341,7 +425,7 @@ impl App {
         let layer = layer_shell.get_layer_surface(
             &wl,
             Some(&out.wl),
-            zwlr_layer_shell_v1::Layer::Background,
+            if self.on_overlay { zwlr_layer_shell_v1::Layer::Overlay } else { zwlr_layer_shell_v1::Layer::Background },
             "wayhaven".into(),
             qh,
             out.global,
@@ -536,6 +620,7 @@ impl App {
                 let es = self.outputs[ready[0]].surface.as_ref().unwrap().egl_surface;
                 self.gfx.make_current(es);
                 mpv.render(frame.fbo.0.get(), frame.w, frame.h);
+                frame.mips = false;
                 if !frame.filled {
                     log::debug!("first frame rendered into {}x{} texture", frame.w, frame.h);
                     frame.filled = true;
@@ -557,6 +642,18 @@ impl App {
 
         let alpha = self.fade_alpha(now);
         let zoom = self.zoom();
+        let lock_t = self.lock_t(now);
+        let lock_animating = self.config.lock_blur && self.lock_anim.animating(now);
+        let lock_zoom = 1.0 + (self.config.lock_zoom - 1.0) * lock_t;
+        let lock_radius = self.config.lock_blur_radius * lock_t;
+        if lock_radius > 0.0 {
+            self.gfx.make_current(None);
+            for f in [self.frame.as_mut(), self.prev.as_mut()].into_iter().flatten() {
+                if f.filled && !f.mips {
+                    self.gfx.generate_mips(f);
+                }
+            }
+        }
         for i in ready {
             let name = self.outputs[i].name.clone();
             let animating = name
@@ -566,7 +663,7 @@ impl App {
             let (fx, fy) = self.parallax_of(name.as_deref(), now);
             let global = self.outputs[i].global;
             let s = self.outputs[i].surface.as_mut().unwrap();
-            if !(s.needs_redraw || animating || fading) {
+            if !(s.needs_redraw || animating || fading || lock_animating) {
                 continue;
             }
             let frame = self.frame.as_ref().filter(|f| f.filled);
@@ -574,15 +671,25 @@ impl App {
                 continue; // nothing to show yet; keep the surface unmapped
             }
             let (bw, bh) = (s.buffer.0 as f64, s.buffer.1 as f64);
+            // Lock radius is in logical pixels
+            let radius = lock_radius * bw / s.logical.0.max(1) as f64;
+            let place = |f: &Frame| {
+                let rect = gfx::zoom_about_center(gfx::layout(bw, bh, f.video_w, f.video_h, zoom, fx, fy), bw, bh, lock_zoom);
+                // The 3x3 tent spans ~1.5 texels of the sampled level
+                let lod = if radius > 0.0 { (radius * f.w as f64 / rect.2 / 1.5).max(1.0).log2() as f32 } else { 0.0 };
+                (rect, lod)
+            };
             self.gfx.make_current(s.egl_surface);
             self.gfx.begin(s.buffer.0, s.buffer.1);
             if let Some(p) = &self.prev {
-                self.gfx.draw(p, gfx::layout(bw, bh, p.video_w, p.video_h, zoom, fx, fy), bw, bh, 1.0);
+                let (rect, lod) = place(p);
+                self.gfx.draw(p, rect, bw, bh, 1.0, lod);
             }
             if let Some(f) = frame {
                 let a = if self.prev.is_some() { alpha } else { 1.0 };
                 if a > 0.0 {
-                    self.gfx.draw(f, gfx::layout(bw, bh, f.video_w, f.video_h, zoom, fx, fy), bw, bh, a);
+                    let (rect, lod) = place(f);
+                    self.gfx.draw(f, rect, bw, bh, a, lod);
                 }
             }
             s.wl.frame(&self.qh, global);
@@ -596,6 +703,22 @@ impl App {
             if let Some(mpv) = &self.mpv {
                 mpv.report_swap();
             }
+        }
+    }
+
+    /// While locked (once the zoom/blur-in finished) the wallpaper sits on the overlay layer,
+    /// so the shell's transparent lock surface shows it instead of the windows.
+    fn sync_lock_layer(&mut self, now: Instant) {
+        let want = self.locked && !(self.config.lock_blur && self.lock_anim.animating(now));
+        if want == self.on_overlay {
+            return;
+        }
+        self.on_overlay = want;
+        let layer = if want { zwlr_layer_shell_v1::Layer::Overlay } else { zwlr_layer_shell_v1::Layer::Background };
+        for s in self.outputs.iter_mut().filter_map(|o| o.surface.as_mut()) {
+            s.layer.set_layer(layer);
+            s.wl.commit();
+            s.needs_redraw = true;
         }
     }
 
@@ -664,6 +787,17 @@ impl App {
                     Err(e) => format!("error: {e}"),
                 })
             }
+            Command::Lock(locked) => {
+                if locked != self.locked {
+                    self.locked = locked;
+                    self.lock_anim.retarget((if locked { 1.0 } else { 0.0 }, 0.0), now);
+                    self.sync_lock_layer(now);
+                    self.mark_all_redraw();
+                    // background.lockWall
+                    self.sync();
+                }
+                Some("ok".into())
+            }
             Command::Ping => Some("pong".into()),
             Command::Quit => {
                 self.running = false;
@@ -698,6 +832,8 @@ impl App {
             .collect();
         serde_json::json!({
             "path": self.current_path,
+            "still": self.frame.as_ref().is_some_and(|f| f.still),
+            "locked": self.locked,
             "paused": self.applied_pause.unwrap_or(false),
             "userPaused": self.user_paused,
             "zoom": self.zoom(),
@@ -898,6 +1034,7 @@ pub fn run(server: Server) -> Result<(), String> {
         outputs: Vec::new(),
         gfx,
         mpv: None,
+        still: Loader::new()?,
         frame: None,
         prev: None,
         fade_start: None,
@@ -909,6 +1046,9 @@ pub fn run(server: Server) -> Result<(), String> {
         current_path: None,
         parallax: HashMap::new(),
         zoom_override: None,
+        locked: false,
+        lock_anim: Parallax::with_duration((0.0, 0.0), LOCK_DURATION),
+        on_overlay: false,
         user_paused: false,
         covered: HashMap::new(),
         applied_pause: None,
@@ -942,6 +1082,7 @@ pub fn run(server: Server) -> Result<(), String> {
             app.refresh_covered();
         }
         app.render();
+        app.sync_lock_layer(Instant::now());
         conn.flush().map_err(|e| e.to_string())?;
 
         let guard = loop {
@@ -960,7 +1101,8 @@ pub fn run(server: Server) -> Result<(), String> {
         const MPV_RENDER: usize = 3;
         const INOTIFY: usize = 4;
         const HYPR: usize = 5;
-        const CLIENTS: usize = 6;
+        const STILL: usize = 6;
+        const CLIENTS: usize = 7;
         let pfd = |fd: i32| libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
         pollfds.clear();
         pollfds.push(pfd(guard.connection_fd().as_raw_fd()));
@@ -969,6 +1111,7 @@ pub fn run(server: Server) -> Result<(), String> {
         pollfds.push(pfd(app.mpv.as_ref().map_or(-1, |m| m.render_fd.as_raw_fd())));
         pollfds.push(pfd(app.watcher.as_ref().map_or(-1, |w| w.fd.as_raw_fd())));
         pollfds.push(pfd(app.hypr.as_ref().map_or(-1, |h| h.events.as_fd().as_raw_fd())));
+        pollfds.push(pfd(app.still.fd.as_raw_fd()));
         for c in &app.clients {
             pollfds.push(pfd(c.stream.as_raw_fd()));
         }
@@ -1004,6 +1147,9 @@ pub fn run(server: Server) -> Result<(), String> {
         }
         if ready(MPV_RENDER) {
             app.on_mpv_render();
+        }
+        if ready(STILL) {
+            app.on_still_decoded();
         }
         if ready(INOTIFY) && app.watcher.as_ref().is_some_and(|w| w.read()) {
             app.config_deadline = Some(Instant::now() + CONFIG_DEBOUNCE);

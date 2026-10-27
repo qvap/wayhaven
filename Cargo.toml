@@ -2,7 +2,7 @@
 name = "wayhaven"
 version = "0.1.0"
 edition = "2021"
-description = "Lightweight GPU-accelerated video wallpaper daemon for Wayland, integrated with the end-4 (illogical-impulse) Quickshell config"
+description = "Lightweight GPU-accelerated wallpaper daemon (images and video) for Wayland, integrated with the end-4 (illogical-impulse) Quickshell config"
 repository = "https://github.com/qvap/wayhaven"
 license = "MIT"
 
@@ -17,6 +17,7 @@ glow = "0.17"
 serde_json = "1"
 libc = "0.2"
 log = { version = "0.4", features = ["std"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "tiff"] }
 
 [profile.release]
 opt-level = 3

@@ -28,6 +28,8 @@ pub enum PauseMode {
 #[derive(Clone, PartialEq, Debug)]
 pub struct Config {
     pub wallpaper_path: String,
+    /// Shown instead while the screen is locked (`background.lockWall`; empty = same wallpaper)
+    pub lock_wall: String,
     pub zoom: f64,
     pub pause_mode: PauseMode,
     pub audio: bool,
@@ -37,12 +39,18 @@ pub struct Config {
     pub crossfade_ms: u64,
     /// Extra mpv options (override the built-in ones); applied when playback starts
     pub mpv_options: Vec<(String, String)>,
+    /// Zoom + blur the wallpaper while the screen is locked (`lock.blur.*`)
+    pub lock_blur: bool,
+    /// Blur radius in screen pixels at full lock
+    pub lock_blur_radius: f64,
+    pub lock_zoom: f64,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
             wallpaper_path: String::new(),
+            lock_wall: String::new(),
             zoom: 1.07,
             pause_mode: PauseMode::Tiled,
             audio: false,
@@ -51,6 +59,9 @@ impl Default for Config {
             hwdec: "auto-safe".into(),
             crossfade_ms: 500,
             mpv_options: Vec::new(),
+            lock_blur: true,
+            lock_blur_radius: 100.0,
+            lock_zoom: 1.1,
         }
     }
 }
@@ -87,6 +98,9 @@ impl Config {
         if let Some(p) = bg["wallpaperPath"].as_str() {
             cfg.wallpaper_path = p.to_string();
         }
+        if let Some(p) = bg["lockWall"].as_str() {
+            cfg.lock_wall = p.to_string();
+        }
         if let Some(z) = bg["parallax"]["workspaceZoom"].as_f64() {
             cfg.zoom = z;
         }
@@ -121,6 +135,16 @@ impl Config {
                 };
                 cfg.mpv_options.push((k.clone(), val));
             }
+        }
+        let lb = &root["lock"]["blur"];
+        if let Some(b) = lb["enable"].as_bool() {
+            cfg.lock_blur = b;
+        }
+        if let Some(x) = lb["radius"].as_f64() {
+            cfg.lock_blur_radius = x.max(0.0);
+        }
+        if let Some(x) = lb["extraZoom"].as_f64() {
+            cfg.lock_zoom = x.clamp(1.0, 3.0);
         }
         if let Some(b) = v["crossfade"].as_bool() {
             if !b {

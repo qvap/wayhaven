@@ -4,18 +4,20 @@ mod gfx;
 mod hypr;
 mod ipc;
 mod mpv;
+mod still;
 
 use std::process::ExitCode;
 
-const USAGE: &str = "wayhaven — video wallpaper daemon for Wayland (end-4 / illogical-impulse integration)
+const USAGE: &str = "wayhaven — wallpaper daemon for Wayland: pictures and video (end-4 / illogical-impulse integration)
 
 Usage:
   wayhaven daemon [-v]          Run the daemon (follows background.wallpaperPath in the shell config)
-  wayhaven set <video>          Play a video now (until the shell config's wallpaper changes)
+  wayhaven set <file>           Show a picture or video now (until the shell config's wallpaper changes)
   wayhaven clear                Drop a manual `set` and follow the shell config again
   wayhaven pause|resume|toggle  Manual pause control
   wayhaven parallax <output|*> <fx> <fy> [zoom]
                                 Move the visible window (fractions 0..1), as the shell does
+  wayhaven lock <0|1>           Lock-screen look: zoom + blur, above the windows (sent by the shell)
   wayhaven reload               Re-read the shell config
   wayhaven status               Print daemon state as JSON
   wayhaven quit                 Stop the daemon

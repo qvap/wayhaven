@@ -2,6 +2,7 @@
 //!
 //! Commands (one per line):
 //!   parallax <output|*> <fx> <fy> [zoom]   fire-and-forget, sent by the shell
+//!   lock <0|1>                              sent by the shell on (un)lock
 //!   set <path> | clear | pause | resume | toggle | reload | status | snapshot <file.ppm> | ping | quit
 
 use std::io::{ErrorKind, Read, Write};
@@ -16,6 +17,8 @@ pub fn socket_path() -> PathBuf {
 pub enum Command {
     Parallax { output: String, fx: f64, fy: f64, zoom: Option<f64> },
     Set(String),
+    /// Screen locked/unlocked: zoom + blur the wallpaper and lift it above the windows
+    Lock(bool),
     Clear,
     Pause,
     Resume,
@@ -47,6 +50,11 @@ fn parse(line: &str) -> Result<Command, String> {
             }
         }
         "set" if !rest.is_empty() => Command::Set(rest.to_string()),
+        "lock" => match rest {
+            "1" | "on" | "true" => Command::Lock(true),
+            "0" | "off" | "false" => Command::Lock(false),
+            _ => return Err("usage: lock <0|1>".into()),
+        },
         "clear" => Command::Clear,
         "pause" => Command::Pause,
         "resume" => Command::Resume,
