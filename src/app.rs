@@ -159,10 +159,25 @@ impl App {
         if self.config.lock_blur { self.lock_anim.value(now).0 } else { 0.0 }
     }
 
-    fn parallax_of(&self, name: Option<&str>, now: Instant) -> (f64, f64) {
+    /// Parallax state of an output: its own, else the `*` entry.
+    fn parallax_entry(&self, name: Option<&str>) -> Option<&Parallax> {
         name.and_then(|n| self.parallax.get(n).or_else(|| self.parallax.get("*")))
-            .map(|p| p.value(now))
-            .unwrap_or((0.5, 0.5))
+    }
+
+    fn parallax_of(&self, name: Option<&str>, now: Instant) -> (f64, f64) {
+        self.parallax_entry(name).map(|p| p.value(now)).unwrap_or((0.5, 0.5))
+    }
+
+    /// When the next running animation ends: the loop must wake then even if no frame callback comes.
+    fn next_anim_end(&self, now: Instant) -> Option<Instant> {
+        let mut ends: Vec<Instant> = self.parallax.values().filter(|p| p.animating(now)).map(|p| p.start + p.duration).collect();
+        if self.lock_anim.animating(now) {
+            ends.push(self.lock_anim.start + self.lock_anim.duration);
+        }
+        if let (Some(t), Some(_)) = (self.fade_start, &self.prev) {
+            ends.push(t + self.fade_duration);
+        }
+        ends.into_iter().min()
     }
 
     // ---------------------------------------------------------------- lifecycle
@@ -223,6 +238,8 @@ impl App {
             ("load-stats-overlay", "no".into()),
             ("load-auto-profiles", "no".into()),
             ("ytdl", "no".into()),
+            // Pictures handed to mpv (formats the image crate can't decode) stay up
+            ("image-display-duration", "inf".into()),
         ];
         if c.audio {
             o.push(("volume", c.volume.to_string()));
@@ -241,6 +258,10 @@ impl App {
             self.show_still(path);
             return;
         }
+        self.play_mpv(path);
+    }
+
+    fn play_mpv(&mut self, path: String) {
         log::info!("playing {path}");
         if self.mpv.is_none() {
             self.gfx.make_current(None);
@@ -263,8 +284,11 @@ impl App {
     fn begin_crossfade(&mut self) {
         self.gfx.make_current(None);
         if let Some(f) = self.frame.take() {
-            if f.filled && self.prev.is_none() {
-                self.prev = Some(f);
+            if f.filled {
+                // Mid-fade the incoming frame is (mostly) what is visible: fade from it
+                if let Some(old) = self.prev.replace(f) {
+                    self.gfx.delete_frame(old);
+                }
             } else {
                 self.gfx.delete_frame(f);
             }
@@ -293,7 +317,9 @@ impl App {
             let (w, h, rgba) = match d.result {
                 Ok(v) => v,
                 Err(e) => {
-                    log::error!("{}: {e}", d.path);
+                    // AVIF, JXL, HEIC...: let mpv/ffmpeg decode it instead of showing nothing
+                    log::warn!("{}: {e}; decoding with mpv", d.path);
+                    self.play_mpv(d.path);
                     continue;
                 }
             };
@@ -345,7 +371,9 @@ impl App {
     fn sync_pause(&mut self) {
         let Some(mpv) = &self.mpv else { return };
         let visible: Vec<&Output> = self.outputs.iter().filter(|o| o.surface.is_some()).collect();
-        let all_covered = !visible.is_empty()
+        // Locked: the wallpaper is the lock-screen background, windows don't hide it
+        let all_covered = !self.locked
+            && !visible.is_empty()
             && visible.iter().all(|o| o.name.as_ref().and_then(|n| self.covered.get(n)).copied().unwrap_or(false));
         let paused = self.user_paused || all_covered;
         if self.applied_pause != Some(paused) {
@@ -369,7 +397,7 @@ impl App {
                 mpv.set("ao", if c.audio { "" } else { "null" });
                 mpv.set("aid", if c.audio { "auto" } else { "no" });
             }
-            if c.audio && c.volume != old.volume {
+            if c.audio && (c.volume != old.volume || !old.audio) {
                 mpv.set("volume", &c.volume.to_string());
             }
         }
@@ -389,6 +417,7 @@ impl App {
         }
         if self.config.zoom != old.zoom && self.zoom_override.is_none() {
             self.ensure_frame();
+            self.mark_all_redraw();
         }
         if (self.config.lock_blur, self.config.lock_blur_radius, self.config.lock_zoom)
             != (old.lock_blur, old.lock_blur_radius, old.lock_zoom)
@@ -563,10 +592,12 @@ impl App {
         }
         self.gfx.make_current(None);
         if let Some(old) = self.frame.take() {
-            if old.filled && self.prev.is_none() {
+            if old.filled {
                 // Resize of the same video: swap without a visible fade
                 self.fade_duration = Duration::ZERO;
-                self.prev = Some(old);
+                if let Some(p) = self.prev.replace(old) {
+                    self.gfx.delete_frame(p);
+                }
             } else {
                 self.gfx.delete_frame(old);
             }
@@ -632,12 +663,10 @@ impl App {
                 }
                 self.frame_dirty = false;
                 rendered_video = true;
-                for o in &mut self.outputs {
-                    if let Some(s) = &mut o.surface {
-                        s.needs_redraw = true;
-                    }
-                }
             }
+        }
+        if rendered_video {
+            self.mark_all_redraw();
         }
 
         let alpha = self.fade_alpha(now);
@@ -656,10 +685,7 @@ impl App {
         }
         for i in ready {
             let name = self.outputs[i].name.clone();
-            let animating = name
-                .as_deref()
-                .and_then(|n| self.parallax.get(n).or_else(|| self.parallax.get("*")))
-                .is_some_and(|p| p.animating(now));
+            let animating = self.parallax_entry(name.as_deref()).is_some_and(|p| p.animating(now));
             let (fx, fy) = self.parallax_of(name.as_deref(), now);
             let global = self.outputs[i].global;
             let s = self.outputs[i].surface.as_mut().unwrap();
@@ -732,6 +758,8 @@ impl App {
                 let first = !self.parallax.contains_key(&output);
                 let shown = self.frame.as_ref().is_some_and(|f| f.filled);
                 let p = self.parallax.entry(output).or_insert_with(|| Parallax::new(target));
+                // The shell repeats unchanged positions; redrawing for those is wasted GPU time
+                let mut changed = first || p.to != target;
                 if !first && shown {
                     p.retarget(target, now);
                 } else {
@@ -741,9 +769,12 @@ impl App {
                     if self.zoom_override != Some(z) {
                         self.zoom_override = Some(z);
                         self.ensure_frame();
+                        changed = true;
                     }
                 }
-                self.mark_all_redraw();
+                if changed {
+                    self.mark_all_redraw();
+                }
                 None
             }
             Command::Set(path) => {
@@ -770,8 +801,13 @@ impl App {
                 Some(if self.user_paused { "paused" } else { "playing" }.into())
             }
             Command::Reload => {
-                self.apply_config(Config::load());
-                Some("ok".into())
+                match Config::load() {
+                    Some(c) => {
+                        self.apply_config(c);
+                        Some("ok".into())
+                    }
+                    None => Some("error: cannot read the shell config; keeping the current one".into()),
+                }
             }
             Command::Status => Some(self.status_json()),
             Command::Snapshot(path) => {
@@ -1041,7 +1077,7 @@ pub fn run(server: Server) -> Result<(), String> {
         fade_duration: Duration::ZERO,
         awaiting_first_frame: false,
         frame_dirty: false,
-        config: Config::load(),
+        config: Config::load().unwrap_or_default(),
         override_path: None,
         current_path: None,
         parallax: HashMap::new(),
@@ -1075,7 +1111,9 @@ pub fn run(server: Server) -> Result<(), String> {
         let now = Instant::now();
         if app.config_deadline.is_some_and(|d| now >= d) {
             app.config_deadline = None;
-            app.apply_config(Config::load());
+            if let Some(c) = Config::load() {
+                app.apply_config(c);
+            }
         }
         if app.hypr_deadline.is_some_and(|d| now >= d) {
             app.hypr_deadline = None;
@@ -1116,10 +1154,11 @@ pub fn run(server: Server) -> Result<(), String> {
             pollfds.push(pfd(c.stream.as_raw_fd()));
         }
 
-        let timeout = [app.config_deadline, app.hypr_deadline]
+        let timeout = [app.config_deadline, app.hypr_deadline, app.next_anim_end(Instant::now())]
             .into_iter()
             .flatten()
-            .map(|d| d.saturating_duration_since(Instant::now()).as_millis().min(i32::MAX as u128) as i32)
+            // Round up: waking a hair early would spin with a 0 ms timeout until the deadline
+            .map(|d| d.saturating_duration_since(Instant::now()).as_micros().div_ceil(1000).min(i32::MAX as u128) as i32)
             .min()
             .unwrap_or(-1);
         let n = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, timeout) };

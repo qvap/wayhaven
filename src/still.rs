@@ -52,12 +52,13 @@ impl Loader {
 }
 
 fn decode(path: &str) -> Result<(u32, u32, Vec<u8>), String> {
-    let mut img = image::ImageReader::open(path)
+    let mut reader = image::ImageReader::open(path)
         .map_err(|e| e.to_string())?
         .with_guessed_format()
-        .map_err(|e| e.to_string())?
-        .decode()
         .map_err(|e| e.to_string())?;
+    // Huge pictures are downscaled right below; the default 512 MiB cap would reject them first
+    reader.no_limits();
+    let mut img = reader.decode().map_err(|e| e.to_string())?;
     let (w, h) = (img.width(), img.height());
     if w.max(h) > MAX_SIDE {
         let k = MAX_SIDE as f64 / w.max(h) as f64;

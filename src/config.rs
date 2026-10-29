@@ -76,14 +76,15 @@ pub fn config_dir() -> PathBuf {
 pub const CONFIG_FILE: &str = "config.json";
 
 impl Config {
-    pub fn load() -> Self {
+    /// `None` when the file can't be read or parsed: callers keep the config they have.
+    pub fn load() -> Option<Self> {
         let path = config_dir().join(CONFIG_FILE);
         let mut cfg = Config::default();
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
             Err(e) => {
                 log::warn!("cannot read {}: {e}", path.display());
-                return cfg;
+                return None;
             }
         };
         let root: Value = match serde_json::from_str(&text) {
@@ -91,7 +92,7 @@ impl Config {
             // The shell may be mid-write; the next inotify event will retry
             Err(e) => {
                 log::warn!("cannot parse {}: {e}", path.display());
-                return cfg;
+                return None;
             }
         };
         let bg = &root["background"];
@@ -151,7 +152,7 @@ impl Config {
                 cfg.crossfade_ms = 0;
             }
         }
-        cfg
+        Some(cfg)
     }
 }
 

@@ -163,3 +163,9 @@ pub fn send(cmd: &str) -> Result<String, String> {
     }
     Ok(String::from_utf8_lossy(&reply).into_owned())
 }
+
+/// CLI side: send a fire-and-forget command (no reply is expected).
+pub fn send_only(cmd: &str) -> Result<(), String> {
+    let mut s = UnixStream::connect(socket_path()).map_err(|e| format!("daemon not running? ({e})"))?;
+    s.write_all(format!("{cmd}\n").as_bytes()).map_err(|e| e.to_string())
+}

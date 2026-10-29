@@ -80,12 +80,22 @@ fn main() -> ExitCode {
         }
         _ => {
             let mut line = args.join(" ");
-            if verb == "set" {
-                // Resolve relative paths against the caller's cwd
-                if let Some(p) = args.get(1..).map(|r| r.join(" ")) {
+            if verb == "set" || verb == "snapshot" {
+                // Resolve relative paths against the caller's cwd, not the daemon's
+                if let Some(p) = args.get(1..).map(|r| r.join(" ")).filter(|p| !p.is_empty()) {
                     let abs = std::path::absolute(&p).map(|a| a.display().to_string()).unwrap_or(p);
-                    line = format!("set {abs}");
+                    line = format!("{verb} {abs}");
                 }
+            }
+            if verb == "parallax" {
+                // Fire-and-forget: the daemon sends no reply
+                return match ipc::send_only(&line) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("wayhaven: {e}");
+                        ExitCode::FAILURE
+                    }
+                };
             }
             match ipc::send(&line) {
                 Ok(reply) => {
